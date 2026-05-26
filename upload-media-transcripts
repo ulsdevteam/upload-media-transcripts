@@ -1,0 +1,736 @@
+#!/usr/bin/python3
+import yaml
+import argparse
+import os
+import pwd
+import json
+import sys
+import subprocess
+import shutil
+import logging
+import csv
+import re
+import pandas as pd
+import warnings
+import tempfile
+import mimetypes
+import requests
+import urllib3
+import time
+from pathlib import Path
+from typing import Union
+from typing import Optional
+from langcodes import Language
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+warnings.filterwarnings("ignore", message="Data Validation extension is not supported")
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Global variables.
+_language_cache: dict | None = None
+
+# Work with the PeerTube API to get the list of languages only once per session, caching the result for future use.
+def get_languages(base_url: str) -> dict:
+    """Fetch language list once per session, caching the result."""
+    global _language_cache
+    if _language_cache is None:
+        response = requests.get(f"{base_url}/api/v1/videos/languages")
+        response.raise_for_status()
+        _language_cache = response.json()
+    return _language_cache
+
+# Given a query, find the matching language code from the PeerTube API languages list.
+def find_language_code(query: str, base_url: str) -> str | None:
+    """
+    Match on either language code or description (case-insensitive),
+    and return the code.
+    """
+    languages = get_languages(base_url)
+    query_lower = query.lower()
+
+    for code, description in languages.items():
+        if query_lower == code.lower() or query_lower == description.lower():
+            return code
+
+    return None
+
+# fetch username of user running script.
+def get_username() -> str:
+    """
+    Retrieves the current logged-in user's username.
+
+    Returns:
+        str: The username of the current user.
+    """
+    return pwd.getpwuid(os.getuid())[0]
+
+# setup logger.
+def setup_logger(name: str, log_file: str, level: int = logging.DEBUG, 
+                 formatter: Optional[logging.Formatter] = None) -> logging.Logger:
+    """
+    Sets up a logger with the specified name, log file, and logging level.
+
+    Args:
+        name (str): The name of the logger, typically the module name (e.g., __name__).
+        log_file (str): The file path to write log messages to. Appends to the file if it exists.
+        level (int, optional): The logging level (e.g., logging.DEBUG, logging.INFO). Defaults to logging.DEBUG.
+        formatter (logging.Formatter, optional): The formatter for log messages. If None, a default formatter is used 
+            with the format: '%(asctime)s - %(name)s - %(levelname)s - %(message)s'.
+
+    Returns:
+        logging.Logger: The configured logger instance.
+
+    Raises:
+        ValueError: If the logging level is invalid.
+        IOError: If the log file cannot be accessed or created.
+
+    Example:
+        >>> logger = setup_logger("my_app", "app.log", logging.INFO)
+        >>> logger.info("Application started")
+    """
+    # Validate logging level
+    if not isinstance(level, int) or level not in {
+        logging.DEBUG, logging.INFO, logging.WARNING, logging.ERROR, logging.CRITICAL
+    }:
+        raise ValueError(f"Invalid logging level: {level}. Use logging.DEBUG, logging.INFO, etc.")
+
+    # Get or create the logger
+    logger = logging.getLogger(name)
+    
+    # Check if the logger already has handlers to avoid duplicates
+    if logger.handlers:
+        return logger  # Logger is already configured, return it as-is
+
+    # Set the logging level
+    logger.setLevel(level)
+
+    # Create a default formatter if none provided
+    if formatter is None:
+        formatter = logging.Formatter(
+            '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+
+    # Set up file handler
+    try:
+        handler = logging.FileHandler(log_file, mode='a')  # Explicitly append mode
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    except IOError as e:
+        raise IOError(f"Failed to set up log file '{log_file}': {str(e)}") from e
+
+    # Prevent propagation to root logger (avoids duplicate logging if root is configured)
+    logger.propagate = False
+
+    return logger
+
+# Read YAML file.
+def read_yaml_file(path: str) -> dict:
+    """
+    Reads a YAML file and returns its content as a dictionary.
+
+    Args:
+        path (str): The path to the YAML file.
+
+    Returns:
+        dict: The content of the YAML file.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        yaml.YAMLError: If there is an error parsing the YAML file.
+        ValueError: If the file content is not a valid dictionary.
+    """
+    try:
+        with open(path, "r") as stream:
+            data = yaml.safe_load(stream)
+            if not isinstance(data, dict):
+                raise ValueError(f"The file content is not a valid dictionary: {path}")
+            return data
+    except FileNotFoundError:
+        print(f"File not found: {path}. Please check the file path and try again.")
+        raise
+    except yaml.YAMLError:
+        print(f"Error parsing YAML file: {path}. Please ensure the file is properly formatted.")
+        raise
+    except ValueError:
+        print(f"Invalid content in YAML file: {path}.")
+        raise
+    except Exception as e:
+        print(f"An unexpected error occurred while reading the YAML file: {str(e)}")
+        raise e
+
+# Login to PeerTube.
+def peertube_login(peertube_instance: str, peertube_username: str, peertube_password: str) -> str:
+    """
+    Logs into a PeerTube instance and retrieves an access token.
+
+    Args:
+        peertube_instance (str): The URL of the PeerTube instance.
+        peertube_username (str): The username for PeerTube login.
+        peertube_password (str): The password for PeerTube login.
+
+    Returns:
+        str: The access token if login is successful; None otherwise.
+    """
+    response = requests.get(f"{peertube_instance}/api/v1/oauth-clients/local", verify=False)
+    client_data = response.json()
+    client_id = client_data['client_id']
+    client_secret = client_data['client_secret']
+    login_url = f'{peertube_instance}/api/v1/users/token'
+    payload = {
+        "client_id"     : client_id,
+        "client_secret" : client_secret,
+        "grant_type"    : "password",
+        "username"      : peertube_username,
+        "password"      : peertube_password,
+    }
+
+    try:
+        # Make the POST request to get the access token
+        response = requests.post(
+            login_url,
+            data=payload,
+            verify=False
+        )
+
+        # Check if request was successful
+        response.raise_for_status()
+
+        # Get the JSON response containing tokens
+        response_data = response.json()
+
+        # Return the access token
+        return response_data['access_token']
+
+    except requests.exceptions.RequestException as e:
+        if hasattr(e.response, 'text'):
+            error_detail = e.response.text
+            logger.error(f"PeerTube Login failed: {error_detail}")
+        logger.error(f"PeerTube Login failed: {str(e)}")
+        return None
+
+# Convert language name to two letter code.
+def convert_to_two_letter_code(language_name: str) -> str:
+    """
+    Converts a language name into its two-letter language code (ISO 639-1).
+
+    Args:
+        language_name (str): The name of the language.
+
+    Returns:
+        str: The two-letter language code.
+    """
+    if (language_name == ""):
+        language_name = "English"
+    try:
+        lang = Language.find(language_name)
+        if lang.language and len(lang.language) == 2:
+            logger.info(f"Converting {language_name} to 2 char language code.")
+            return lang.language
+        return ""
+    except LookupError:
+        logger.warning(f"Failed to convert {language_name} to 2 char.")
+        return ""
+
+def convert_lang_three_to_two(language_name: str) -> str:
+
+    logger.info(f"convert_lang_three_to_two - In: {language_name}")
+    if (language_name == ""):
+        language_name = "English"
+    try:
+        lang = Language.get(language_name)
+        two_char_code = lang.language
+        logger.info(f"convert_lang_three_to_two - Out: {two_char_code}.")
+        return two_char_code
+    except ValueError:
+        logger.info(f"Failed to convert {language_name} to 2 char.")
+        return "zxx"
+
+def connect_to_google_sheet(credentials_file: str):
+    """
+    Connects to the Google Sheets API using service account credentials.
+
+    Args:
+        credentials_file (str): Path to the Google service account credentials file.
+
+    Returns:
+        build: The Google Sheets API service object.
+    """
+    SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+    CONFIG_FILE = credentials_file
+
+    logger.info(f"connect_to_google_sheet: Credentials file: {CONFIG_FILE}")
+
+    if not os.path.exists(CONFIG_FILE):
+        raise Exception(f"Configuration file not found: {CONFIG_FILE}")
+
+    try:
+        creds = service_account.Credentials.from_service_account_file(
+            CONFIG_FILE,
+            scopes=SCOPES
+        )
+
+        service = build('sheets', 'v4', credentials=creds)
+        return service
+
+    except Exception as e:
+        raise Exception(f"Failed to create Google Sheets service: {str(e)}")
+
+def read_google_sheet(spreadsheet_id: str, sheet_name="Sheet1", credentials_file="configuration.json") -> pd.DataFrame:
+    """
+    Reads data from a Google Sheet into a pandas DataFrame.
+
+    Args:
+        spreadsheet_id (str): The ID of the Google Sheet.
+        sheet_name (str): The name of the sheet to read data from.
+        credentials_file (str): Path to the Google service account credentials file.
+
+    Returns:
+        pandas.DataFrame: The data from the Google Sheet.
+    """
+    try:
+        # Build the service
+        logger.info(f"Connecting to Google Sheet using credentials file: {credentials_file}")
+        logger.info(f"SheetID: {spreadsheet_id}, Sheet Name: {sheet_name}")
+        service = connect_to_google_sheet(credentials_file)
+
+        # Call the Sheets API
+        sheet = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=sheet_name
+        ).execute()
+
+        # Get the values
+        data = sheet.get('values', [])
+
+        if not data:
+            logger.warning(f"read_google_sheet - No data found in the specified worksheet.")
+            print('No data found in the specified worksheet.')
+            
+            # Return empty DataFrame
+            return pd.DataFrame()
+
+        else:
+            logger.info(f"read_google_sheet - Read of Google Sheet Successful.")
+            print(f" Read of Google Sheet Successful.")
+
+            # Convert to DataFrame
+            # First row as headers, rest as data
+            headers = data[0]
+            rows = data[1:] if len(data) > 1 else []
+
+            # Pad rows with fewer columns with fill_value
+            fill_value = None
+            max_columns = len(headers)
+            padded_rows = [row + [fill_value] * (max_columns - len(row)) for row in rows]
+
+            # Create DataFrame
+            df = pd.DataFrame(padded_rows, columns=headers)
+
+            return df
+
+    except Exception as e:
+        print(f"Error accessing Google Sheet: {str(e)}")
+        return pd.DataFrame()
+
+def is_valid_dataframe(df: pd.DataFrame) -> bool:
+    """
+    Determines if a DataFrame is valid (not empty and of correct type).
+
+    Args:
+        df (pandas.DataFrame): The DataFrame to validate.
+
+    Returns:
+        bool: True if valid, False otherwise.
+    """
+    return isinstance(df, pd.DataFrame) and not df.empty
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description='upload-media-to-peertube.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # Required arguments:
+    parser.add_argument('--config-file', dest="config_file", required=True, help='Path to the YAML configuration file.')
+    parser.add_argument('--log-file', dest="log_file", required=True, help='Path to the log file.')
+    parser.add_argument('--dry-run', dest="dry_run", required=False, default=False, choices=['True','False'], help='Run but do not upload.')
+    parser.add_argument('--env', dest="peertube_env", required=True, help='Environment to upload media to related to the environments in the config file.')
+
+    # Optional arguments:
+    parser.add_argument('--in-google-sheet-id', dest="in_gs_id", help='Google Sheet ID.')
+    parser.add_argument('--in-google-sheet-name', dest="in_gs_name", help='Google Sheet Tab name.')
+    parser.add_argument('--in-google-creds-file', dest="in_gs_creds", help='Google Credential json file.')
+    parser.add_argument('--peertube-instance', dest="peertube_instance", help='PeerTube instance URL.')
+    parser.add_argument('--peertube-username', dest="peertube_username", help='PeerTube account username.')
+    parser.add_argument('--peertube-password', dest="peertube_password", help='PeerTube account password.')
+    parser.add_argument('--peertube-channel', dest="peertube_channel", help='PeerTube channel number.')
+
+    # Parse the arguments:
+    args = parser.parse_args()
+
+    # Return the argument list:
+    return args
+
+def get_mimetype(infile):
+    mime_type, encoding = mimetypes.guess_type(infile)
+    return mime_type or 'application/octet_stream'
+
+def peertube_add_caption(
+    access_token: str,
+    video_id: str,
+    language: str,
+    caption_file_path: str
+) -> dict:
+    """
+    Upload a caption file to a PeerTube video.
+
+    Args:
+        video_id (str): UUID or short UUID of the video
+        language (str): Language code for the caption (e.g., 'en', 'fr')
+        caption_file_path (str): Path to the caption file (.srt or .vtt)
+        access_token (str): Bearer token for authentication
+
+    Returns:
+        dict: Response from the API with status
+
+    Raises:
+        FileNotFoundError: If the caption file doesn't exist
+        ValueError: If the file format is invalid
+        requests.exceptions.RequestException: If the API request fails
+    """
+
+    # Validate caption file
+    if not os.path.exists(caption_file_path):
+        raise FileNotFoundError(f"Caption file not found: {caption_file_path}")
+
+    if not caption_file_path.lower().endswith(('.srt', '.vtt')):
+        raise ValueError("Caption file must be .srt or .vtt format")
+
+    # Prepare API endpoint
+    add_caption_endpoint = f"{peertube_instance.rstrip('/')}/api/v1/videos/{video_id}/captions/{language}"
+    logger.info(f"Add Caption Endpoint: {add_caption_endpoint}")
+
+    # Prepare headers
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    # For testing.
+    logger.info(f"Adding caption {caption_file_path} to Video {video_id} with language {language}")
+    print(f"Adding caption {caption_file_path}")
+    print(f"To Video {video_id} with language {language}")
+    logger.info(f"Caption file path: {caption_file_path}")
+    logger.info(f"Caption file mime type: {get_mimetype(caption_file_path)}")
+    
+
+    if dry_run:
+        logger.info(f"Dry run enabled - skipping actual caption upload.")
+        return {
+            "status": 200,
+            "message": "Dry run - caption upload skipped",
+            "data": None
+        }
+    else:
+        logger.info(f"Dry run not enabled - proceeding with caption upload.")
+        
+        # Prepare file for upload
+        with open(caption_file_path, 'rb') as caption_file:
+            caption_files = {
+                'captionfile': (
+                    os.path.basename(caption_file_path),
+                    caption_file,
+                    get_mimetype(caption_file_path)
+                )
+            }
+        logger.info(f"Prepared caption file for upload: {caption_files['captionfile'][0]}, MIME type: {caption_files['captionfile'][2]}")
+
+        # Upload caption
+        try:
+            # Make PUT request to upload caption
+            response = requests.put(add_caption_endpoint, headers=headers, files=caption_files, verify=False)
+
+            # Handle HTTP 204 (No Content) for successful upload
+            if response.status_code == 204:
+                logger.info("Caption uploaded successfully, received 204 No Content response.")
+                return {
+                    "status": 204,
+                    "message": "Caption uploaded successfully",
+                    "data": None
+                }
+
+            # Try to parse JSON response for other status codes
+            try:
+                response_data = response.json()
+            except ValueError:
+                response_data = {
+                    "raw_response": response.text or "Empty response"
+                }
+                logger.error(f"Failed to parse response as JSON. Raw response: {response_data['raw_response']}")
+                print(f"Failed to parse response as JSON. Raw response: {response_data['raw_response']}")
+
+            # Check response status
+            try:
+                response.raise_for_status()
+            except requests.exceptions.HTTPError as e:
+                try: 
+                    error_details = response.json()
+                except ValueError:
+                    error_details = {
+                        "raw_response": response.text or "Empty response"
+                    }
+                    logger.error(f"Failed to parse error response as JSON. Raw response: {error_details['raw_response']}")
+                    print(f"Failed to parse error response as JSON. Raw response: {error_details['raw_response']}")
+                logger.error(f"HTTP error occurred: {str(e)} | Details: {error_details}")
+                print(f"HTTP error occurred: {str(e)} | Details: {error_details}")
+                return {
+                    "status": response.status_code,
+                    "error": str(e),
+                    "details": error_details
+                }
+
+            # Return response data for successful upload (non-204)
+            return {
+                "status": response.status_code,
+                "message": f"Caption uploaded successfully received non-204 response: {response.status_code}",
+                "data": response_data
+            }
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {str(e)}")
+            print(f"API request failed: {str(e)}")
+            return {
+                "status": None,
+                "error": f"API request failed: {str(e)}",
+                "details": None
+            }
+
+def process_row(df: pd.DataFrame, row) -> pd.DataFrame:
+    # Required Vars for all media objects.
+    video_id    = row['id']
+    video_title = row['title']
+    video_file  = row['file']
+
+    # Optional Vars for optional components.
+    video_transcript = ''
+    video_transcript_lang = ''
+    video_url = ''
+
+    # Determine the required components.
+    transcript = False
+    if 'transcript' in df.columns:
+        if not row['transcript'] == None:
+            transcript = True
+            video_transcript = row['transcript']
+            logger.info(f"Video transcript column found.")
+
+    peertube_media_shortUUID = ''
+    if 'field_media_oembed_video' in df.columns:
+        if not row['field_media_oembed_video'] == "":
+            video_url = row['field_media_oembed_video']
+            parsed = urllib3.util.parse_url(video_url)
+            path_parts = parsed.path.strip('/').split('/')
+            logger.info(f"Parsed field_media_oembed_video: {path_parts}")
+            peertube_media_shortUUID = path_parts[1]
+            logger.info(f"Short UUID = {peertube_media_shortUUID}")
+
+    # Get Transcript Language and validate it against the PeerTube API languages list if a transcript exists.
+    if transcript:
+        if 'transcript_language' in df.columns:
+            if not row['transcript_language'] == "":
+                video_transcript_lang = find_language_code(row['transcript_language'], peertube_instance)
+                logger.info(f"Transcript language code: {video_transcript_lang}")
+            else:
+                video_transcript_lang = "zxx"
+                logger.info(f"Transcript language code: {video_transcript_lang}")
+        else:
+            # Set vidoe_transcript_lang to Default of 'en'
+            logger.info(f"Transcript language code: 'zxx' (default)")
+            video_transcript_lang = "zxx"
+                    
+    # Add the Transcript to the Media Object if the transcript exists and if the upload was successful.
+    if transcript:
+        # Add a transcript to the previously uploaded media.
+        logger.info(f"{video_id} Transcript/Caption upload - file: {video_transcript}")
+        logger.info(f"PeerTube Video:{peertube_media_shortUUID}")
+        logger.info(f"Transcript Language:{video_transcript_lang}")
+        # Upload transcript
+        peertube_caption_result = peertube_add_caption(access_token,peertube_media_shortUUID,video_transcript_lang,video_transcript)
+        
+        # Get the upload status and log the result.
+        caption_status = peertube_caption_result["status"]
+        if caption_status == 200:
+            logger.info(f"{video_id} Transcription/Caption upload - 200 Success.")
+        elif caption_status == 204:
+            logger.info(f"{video_id} Transcription/Caption upload - 204 Successful Upload of Caption.")
+        elif caption_status == 400:
+            logger.warning(f"{video_id} Transcription/Caption upload - 400 Error - {peertube_caption_result["error"]}.")
+        elif caption_status == 404:
+            logger.warning(f"{video_id} Transcription/Caption upload - 404 Video or Language not found.")
+        else:
+            logger.error(f"{video_id} Transcription/Caption upload - Error: {caption_status}.")
+    else:
+        logger.info(f"Transcript/Caption was not added to Media {video_id}")
+
+    return df
+
+
+def process_sheet(sheet_id: str, sheet_name: str, credentials_file):
+    logger.info(f"process_sheet - Processing Sheet: {sheet_id},{sheet_name}")
+
+    # Read the Sheet
+    df = read_google_sheet(sheet_id, sheet_name, credentials_file)
+
+    # Check for Required columns
+    required_columns = ['id','title','file','field_media_oembed_video']
+    optional_columns = ['description','language','transcript','transcript_language']
+    
+    row_count = 1
+    if all(col in df.columns for col in required_columns):
+        logger.info(f"Begin Processing Sheet: {sheet_id},{sheet_name}.")
+                
+        # Process each row in the sheet
+        for index,row in df.iterrows():
+            # Get Row information.
+            video_id    = row['id']
+
+            # Proces the row
+            logger.info(f"-----------------------------------------------------")
+            print(f"-----------------------------------------------------")
+            logger.info(f"Processing Row {row_count} - Video ID: {video_id}")
+            print(f"Processing Row {row_count} - Video ID: {video_id}")
+            #logger.info(f"Processing: {video_id}")
+            #print(f"Processing: {video_id}")
+            df = process_row(df, row)
+            row_count = row_count + 1
+        logger.info(f"Finished processing sheet: {sheet_id}, {sheet_name}. Processed {row_count} rows.")
+        print(f"-----------------------------------------------------")
+        print(f"Finished processing sheet: {sheet_id}, {sheet_name}. ")
+        print(f"Processed {row_count} rows.")
+    else:
+        logger.warning(f"One or more required columns are missing from the sheet.")
+        print(f"One or more required columns are missing from the sheet.")
+        print(f"Required columns are: {required_columns}.")
+        logger.warning(f"Existing Columns are: {df.columns}.")
+        print(f"Existing columns are: {df.columns}.")
+        exit()
+
+    return row_count
+
+def main():
+    # Setup the log file format.
+    log_formatter = logging.Formatter(fmt='%(asctime)s.%(msecs)03d %(levelname)s %(message)s',datefmt="%Y%m%d %H:%M:%S")
+
+    # Parse command line arguements.
+    args = parse_arguments()
+    
+    # Obtain the user running the script.
+    username            = get_username()
+    
+    # Get the configuration file contents.
+    cfg                 = read_yaml_file(args.config_file)
+
+    # Set the environment that we wish to push the videos to.
+    if args.peertube_env:
+        env_key = args.peertube_env
+    else:
+        print(f"No environment provided. Please provide an environment using the --env parameter related to the environments in the config file.")
+        exit(1)
+
+
+    env_cfg = cfg["environments"][env_key]
+
+    # Set PeerTube variables from config file.
+    peertube_instance   = env_cfg['peertube_instance']
+    peertube_username   = env_cfg['peertube_username']
+    peertube_password   = env_cfg['peertube_password']
+    peertube_channel    = env_cfg['peertube_channel']
+    
+    globals()['peertube_instance'] = peertube_instance
+    globals()['peertube_username'] = peertube_username
+    globals()['peertube_password'] = peertube_password
+    globals()['peertube_channel'] = peertube_channel
+    
+    # Set Google variables.
+    google_credentials  = None
+    google_sheet_id     = None
+    google_sheet_name   = None
+    
+    # Override config file variable with command line parameters if they exist.
+    if args.in_gs_creds is not None:
+        google_credentials  = args.in_gs_creds
+    else:
+        if cfg['google_credentials_file'] and cfg['google_credentials_file'] is not None:
+            google_credentials  = cfg['google_credentials_file']
+
+    if args.in_gs_id is not None:    
+        google_sheet_id     = args.in_gs_id
+    else:
+        if cfg['google_sheet_id'] and cfg['google_sheet_id'] is not None: 
+            google_sheet_id     = cfg['google_sheet_id']
+
+    if args.in_gs_name is not None:
+        google_sheet_name   = args.in_gs_name
+    else:
+        if cfg['google_sheet_name'] and cfg['google_sheet_name'] is not None:
+            google_sheet_name   = cfg['google_sheet_name']
+    
+
+    print(f"PeerTube Channel: {peertube_channel}")
+
+	# Set Log file path from config file.
+    globals()['log_file']            = cfg['log_file']
+
+    # Set Dry_Run from command line.
+    globals()['dry_run'] = args.dry_run
+
+    # Set Default Thumbnails from config file.
+    globals()['thumbnail_audio'] = cfg['thumbnail_audio']
+    globals()['thumbnail_video'] = cfg['thumbnail_video']    
+
+    # Override config file variable with command line parameters if they exist.
+    if args.in_gs_creds is not None:
+        google_credentials = args.in_gs_creds
+    if args.in_gs_id is not None:
+        google_sheet_id = args.in_gs_id
+    if args.in_gs_name is not None:
+        google_sheet_name = args.in_gs_name
+    if args.log_file is not None:
+        log_file = args.log_file
+
+    globals()['peertube_channel'] = peertube_channel
+    globals()['peertube_instance'] = peertube_instance
+
+    # Create the Log file.
+    print(f"Creating log file: {args.log_file}")
+    globals()['logger'] = setup_logger('logger', log_file, level=logging.DEBUG, formatter=log_formatter)
+    logger.info(f"Begin log.")
+
+    logger.info(f"Processing Sheet: {google_sheet_id}, Tab:{google_sheet_name}")
+    logger.info(f"Peertube Instance:{peertube_instance}, Channel:{peertube_channel}")
+
+    # Login to PeerTube.
+    logger.info(f"Login to PeerTube: {peertube_instance}, {peertube_username}")
+    access_token = peertube_login(peertube_instance,peertube_username,peertube_password)
+    if access_token is None:
+        logger.error(f"Login to PeerTube instance {peertube_instance} failed.")
+        print(f"Login to PeerTube instance {peertube_instance} failed.")
+        exit(1)
+    else:
+        globals()['access_token'] = access_token
+        logger.info(f"Login to PeerTube instance {peertube_instance} successful.")
+
+    # Process the sheet.
+    logger.info(f"Begin Processing the sheet.")
+    ret = process_sheet(google_sheet_id,google_sheet_name,google_credentials)
+    logger.info(f"End Processing the sheet.")
+
+    # Exit.
+    logger.info(f"Process complete.")
+    print(f"Process complete.")
+    exit()
+
+# Begin
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,40 @@
+#--------------------------------------------------------------------
+# upload-media-transcripts config file.
+# This is the config file for the upload-media-transcripts script.
+#--------------------------------------------------------------------
+
+#--------------------------------------------------------------------
+# PeerTube Environments
+#--------------------------------------------------------------------
+environments:
+  production:
+    peertube_instance:
+    peertube_username: 
+    peertube_password: 
+    peertube_channel: 
+
+  review:
+    peertube_instance: 
+    peertube_username: 
+    peertube_password:
+    peertube_channel:
+
+#--------------------------------------------------------------------
+# Google Sheets Settings
+#--------------------------------------------------------------------
+# Google Credentials File location:
+google_credentials_file: /credentials.json
+google_sheet: 
+google_sheet_name: Sheet1
+
+#--------------------------------------------------------------------
+# Log file
+#--------------------------------------------------------------------
+log_file: /var/tmp/output.log
+
+#--------------------------------------------------------------------
+# Default Thumbnail Files
+#--------------------------------------------------------------------
+thumbnail_audio: /workbench/lib/thumbnails/thumbnail_audio.jpg
+thumbnail_video: /workbench/lib/thumbnails/thumbnail_video.jpg
+
