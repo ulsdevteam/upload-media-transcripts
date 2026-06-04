@@ -378,6 +378,16 @@ def parse_arguments():
     return args
 
 def get_mimetype(infile):
+    """
+    Obtain the mimetype of the infile.
+
+    Args:
+        infile (str): The path to the file to inspect.
+
+    Returns:
+        mime_type (str): The mimetype of the file or 
+        'application/octet_stream' if not found.
+    """ 
     mime_type, encoding = mimetypes.guess_type(infile)
     return mime_type or 'application/octet_stream'
 
@@ -407,9 +417,11 @@ def peertube_add_caption(
 
     # Validate caption file
     if not os.path.exists(caption_file_path):
+        logger.error(f"Caption file not found: {caption_file_path}")
         raise FileNotFoundError(f"Caption file not found: {caption_file_path}")
 
     if not caption_file_path.lower().endswith(('.srt', '.vtt')):
+        logger.warning(f"Caption file must be .srt or .vtt format")
         raise ValueError("Caption file must be .srt or .vtt format")
 
     # Prepare API endpoint
@@ -448,67 +460,67 @@ def peertube_add_caption(
                     get_mimetype(caption_file_path)
                 )
             }
-        logger.info(f"Prepared caption file for upload: {caption_files['captionfile'][0]}, MIME type: {caption_files['captionfile'][2]}")
+            logger.info(f"Prepared caption file for upload: {caption_files['captionfile'][0]}, MIME type: {caption_files['captionfile'][2]}")
 
-        # Upload caption
-        try:
-            # Make PUT request to upload caption
-            response = requests.put(add_caption_endpoint, headers=headers, files=caption_files, verify=False)
-
-            # Handle HTTP 204 (No Content) for successful upload
-            if response.status_code == 204:
-                logger.info("Caption uploaded successfully, received 204 No Content response.")
-                return {
-                    "status": 204,
-                    "message": "Caption uploaded successfully",
-                    "data": None
-                }
-
-            # Try to parse JSON response for other status codes
+            # Upload the caption
             try:
-                response_data = response.json()
-            except ValueError:
-                response_data = {
-                    "raw_response": response.text or "Empty response"
-                }
-                logger.error(f"Failed to parse response as JSON. Raw response: {response_data['raw_response']}")
-                print(f"Failed to parse response as JSON. Raw response: {response_data['raw_response']}")
+                # Make PUT request to upload caption
+                response = requests.put(add_caption_endpoint, headers=headers, files=caption_files, verify=False)
 
-            # Check response status
-            try:
-                response.raise_for_status()
-            except requests.exceptions.HTTPError as e:
-                try: 
-                    error_details = response.json()
+                # Handle HTTP 204 (No Content) for successful upload
+                if response.status_code == 204:
+                    logger.info("Caption uploaded successfully, received 204 No Content response.")
+                    return {
+                        "status": 204,
+                        "message": "Caption uploaded successfully",
+                        "data": None
+                    }
+
+                # Try to parse JSON response for other status codes
+                try:
+                    response_data = response.json()
                 except ValueError:
-                    error_details = {
+                    response_data = {
                         "raw_response": response.text or "Empty response"
                     }
-                    logger.error(f"Failed to parse error response as JSON. Raw response: {error_details['raw_response']}")
-                    print(f"Failed to parse error response as JSON. Raw response: {error_details['raw_response']}")
-                logger.error(f"HTTP error occurred: {str(e)} | Details: {error_details}")
-                print(f"HTTP error occurred: {str(e)} | Details: {error_details}")
+                    logger.error(f"Failed to parse response as JSON. Raw response: {response_data['raw_response']}")
+                    print(f"Failed to parse response as JSON. Raw response: {response_data['raw_response']}")
+
+                # Check response status
+                try:
+                    response.raise_for_status()
+                except requests.exceptions.HTTPError as e:
+                    try: 
+                        error_details = response.json()
+                    except ValueError:
+                        error_details = {
+                            "raw_response": response.text or "Empty response"
+                        }
+                        logger.error(f"Failed to parse error response as JSON. Raw response: {error_details['raw_response']}")
+                        print(f"Failed to parse error response as JSON. Raw response: {error_details['raw_response']}")
+                    logger.error(f"HTTP error occurred: {str(e)} | Details: {error_details}")
+                    print(f"HTTP error occurred: {str(e)} | Details: {error_details}")
+                    return {
+                        "status": response.status_code,
+                        "error": str(e),
+                        "details": error_details
+                    }
+
+                # Return response data for successful upload (non-204)
                 return {
                     "status": response.status_code,
-                    "error": str(e),
-                    "details": error_details
+                    "message": f"Caption uploaded successfully received non-204 response: {response.status_code}",
+                    "data": response_data
                 }
 
-            # Return response data for successful upload (non-204)
-            return {
-                "status": response.status_code,
-                "message": f"Caption uploaded successfully received non-204 response: {response.status_code}",
-                "data": response_data
-            }
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {str(e)}")
-            print(f"API request failed: {str(e)}")
-            return {
-                "status": None,
-                "error": f"API request failed: {str(e)}",
-                "details": None
-            }
+            except requests.exceptions.RequestException as e:
+                logger.error(f"API request failed: {str(e)}")
+                print(f"API request failed: {str(e)}")
+                return {
+                    "status": None,
+                    "error": f"API request failed: {str(e)}",
+                    "details": None
+                }
 
 def process_row(df: pd.DataFrame, row) -> pd.DataFrame:
     # Required Vars for all media objects.
@@ -597,7 +609,9 @@ def process_sheet(sheet_id: str, sheet_name: str, credentials_file):
         # Process each row in the sheet
         for index,row in df.iterrows():
             # Get Row information.
-            video_id    = row['id']
+            video_id   = row['id']
+            oembed_url = row['field_media_oembed_video']
+            transcript = row['transcript']
 
             # Proces the row
             logger.info(f"-----------------------------------------------------")
@@ -608,7 +622,10 @@ def process_sheet(sheet_id: str, sheet_name: str, credentials_file):
             #print(f"Processing: {video_id}")
             df = process_row(df, row)
             row_count = row_count + 1
-        logger.info(f"Finished processing sheet: {sheet_id}, {sheet_name}. Processed {row_count} rows.")
+            logger.info(f"Finished processing sheet: {sheet_id}, {sheet_name}. Processed {row_count} rows.")
+            logger.info(f"Video {oembed_url} added caption file {transcript}.")
+            print(f"Video {oembed_url} added caption file {transcript}.")
+
         print(f"-----------------------------------------------------")
         print(f"Finished processing sheet: {sheet_id}, {sheet_name}. ")
         print(f"Processed {row_count} rows.")
@@ -618,7 +635,7 @@ def process_sheet(sheet_id: str, sheet_name: str, credentials_file):
         print(f"Required columns are: {required_columns}.")
         logger.warning(f"Existing Columns are: {df.columns}.")
         print(f"Existing columns are: {df.columns}.")
-        exit()
+        exit(1)
 
     return row_count
 
@@ -733,7 +750,7 @@ def main():
     # Exit.
     logger.info(f"Process complete.")
     print(f"Process complete.")
-    exit()
+    exit(0)
 
 # Begin
 if __name__ == "__main__":
