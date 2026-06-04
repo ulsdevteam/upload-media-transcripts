@@ -39,8 +39,6 @@ log_file: /path/to/logfile.log
 google_credentials_file: /path/to/google-service-account.json
 google_sheet_id: "your_google_sheet_id"
 google_sheet_name: "Sheet1"
-thumbnail_audio: /path/to/audio-thumbnail.jpg
-thumbnail_video: /path/to/video-thumbnail.jpg
 
 environments:
   production:

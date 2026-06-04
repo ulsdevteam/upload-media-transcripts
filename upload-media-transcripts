@@ -706,10 +706,6 @@ def main():
     # Set Dry_Run from command line.
     globals()['dry_run'] = args.dry_run
 
-    # Set Default Thumbnails from config file.
-    globals()['thumbnail_audio'] = cfg['thumbnail_audio']
-    globals()['thumbnail_video'] = cfg['thumbnail_video']    
-
     # Override config file variable with command line parameters if they exist.
     if args.in_gs_creds is not None:
         google_credentials = args.in_gs_creds
