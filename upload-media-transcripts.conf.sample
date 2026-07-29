@@ -32,3 +32,13 @@ google_sheet_name: Sheet1
 #--------------------------------------------------------------------
 log_file: /var/tmp/output.log
 
+#--------------------------------------------------------------------
+# Default Thumbnail Files
+#--------------------------------------------------------------------
+thumbnail_audio: /workbench/lib/thumbnails/thumbnail_audio.jpg
+thumbnail_video:
+
+#--------------------------------------------------------------------
+# id_column - the column name containing object identifiers.
+#--------------------------------------------------------------------
+id_column: id
