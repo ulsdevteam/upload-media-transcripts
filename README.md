@@ -40,6 +40,8 @@ google_credentials_file: /path/to/google-service-account.json
 google_sheet_id: "your_google_sheet_id"
 google_sheet_name: "Sheet1"
 
+id_column: id
+
 environments:
   production:
     peertube_instance: https://your-peertube-instance.example.com
@@ -55,6 +57,8 @@ environments:
 
 Multiple environments can be defined under `environments:`. The `--env` argument selects which one to use at runtime.
 
+id_column sets the name of the column in the Google Sheet used as the unique identifier for each video record.  Defaults to id if omitted. Can be overridden at runtime with --id-column.
+
 ---
 
 ## Google Sheet Format
@@ -62,8 +66,8 @@ Multiple environments can be defined under `environments:`. The `--env` argument
 The script reads from a Google Sheet with the following columns:
 
 | Column | Required | Description |
-|--------|----------|-------------|
-| `id` | Yes | A local identifier for the video record |
+|:----|:----|:----|
+| (configurable, default `id`) | Yes | A local identifier for the video record. Column name is set via id_column in the config file or --id-column on the command line. |
 | `title` | Yes | Title of the video |
 | `file` | Yes | Path to the local video/media file |
 | `field_media_oembed_video` | Yes | Full URL to the PeerTube video (used to extract the short UUID) |
@@ -98,6 +102,7 @@ python upload-media-transcripts.py \
 | `--peertube-username` | No | Override the PeerTube username |
 | `--peertube-password` | No | Override the PeerTube password |
 | `--peertube-channel` | No | Override the PeerTube channel number |
+| `--id-column` | No | Override the name of the identifier column from config (default: `id`)|
 
 ### Dry Run Example
 

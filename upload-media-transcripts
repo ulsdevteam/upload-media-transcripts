@@ -370,6 +370,7 @@ def parse_arguments():
     parser.add_argument('--peertube-username', dest="peertube_username", help='PeerTube account username.')
     parser.add_argument('--peertube-password', dest="peertube_password", help='PeerTube account password.')
     parser.add_argument('--peertube-channel', dest="peertube_channel", help='PeerTube channel number.')
+    parser.add_argument('--id-column', dest="id_column", help='Name of the column to use as the unique row/media identifier (default: "id").')
 
     # Parse the arguments:
     args = parser.parse_args()
@@ -524,7 +525,7 @@ def peertube_add_caption(
 
 def process_row(df: pd.DataFrame, row) -> pd.DataFrame:
     # Required Vars for all media objects.
-    video_id    = row['id']
+    video_id    = row[id_column]
     video_title = row['title']
     video_file  = row['file']
 
@@ -599,7 +600,7 @@ def process_sheet(sheet_id: str, sheet_name: str, credentials_file):
     df = read_google_sheet(sheet_id, sheet_name, credentials_file)
 
     # Check for Required columns
-    required_columns = ['id','title','file','field_media_oembed_video']
+    required_columns = [id_column,'title','file','field_media_oembed_video']
     optional_columns = ['description','language','transcript','transcript_language']
     
     row_count = 1
@@ -609,7 +610,7 @@ def process_sheet(sheet_id: str, sheet_name: str, credentials_file):
         # Process each row in the sheet
         for index,row in df.iterrows():
             # Get Row information.
-            video_id   = row['id']
+            video_id   = row[id_column]
             oembed_url = row['field_media_oembed_video']
             transcript = row['transcript']
 
@@ -678,6 +679,11 @@ def main():
     google_sheet_id     = None
     google_sheet_name   = None
     
+    # Set id_column variable (default to 'id' if not specified anywhere).
+    id_column = 'id'
+    if cfg.get('id_column') and cfg['id_column'] is not None:
+        id_column = cfg['id_column']
+    
     # Override config file variable with command line parameters if they exist.
     if args.in_gs_creds is not None:
         google_credentials  = args.in_gs_creds
@@ -696,7 +702,6 @@ def main():
     else:
         if cfg['google_sheet_name'] and cfg['google_sheet_name'] is not None:
             google_sheet_name   = cfg['google_sheet_name']
-    
 
     print(f"PeerTube Channel: {peertube_channel}")
 
@@ -715,9 +720,12 @@ def main():
         google_sheet_name = args.in_gs_name
     if args.log_file is not None:
         log_file = args.log_file
+    if args.id_column is not None:
+        id_column = args.id_column
 
     globals()['peertube_channel'] = peertube_channel
     globals()['peertube_instance'] = peertube_instance
+    globals()['id_column'] = id_column
 
     # Create the Log file.
     print(f"Creating log file: {args.log_file}")
