@@ -1,4 +1,4 @@
-# update-media-transcripts
+# upload-media-transcripts
 
 A Python script for uploading caption/transcript files to PeerTube videos, driven by a Google Sheet that maps video metadata to caption files.
 
